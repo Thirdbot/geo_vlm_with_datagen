@@ -1,8 +1,6 @@
-import base64
 import json
 import random
 from collections import defaultdict
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -215,11 +213,7 @@ class MultiTaskCollator:
         return Image.open(path).convert("RGB")
 
     def _load_mask(self, row):
-        if row.get("result_image_base64"):
-            image_bytes = base64.b64decode(row["result_image_base64"])
-            mask = Image.open(BytesIO(image_bytes)).convert("L")
-        else:
-            mask = Image.open(row["target_image_path"]).convert("L")
+        mask = Image.open(row["target_image_path"]).convert("L")
 
         mask_array = np.array(mask, dtype=np.float32) / 255.0
         return torch.from_numpy(mask_array)

@@ -3,6 +3,7 @@ import base64
 import json
 import mimetypes
 import re
+from collections import Counter
 
 from click import prompt
 import anthropic
@@ -192,14 +193,68 @@ class DataGenerator:
                 text_nodes.append((item, item.get("score",None), item.get("page",None))) # ranking use indexing ,so no change
         return text_nodes,image_nodes
 
-    def generate(self, questions_per_reference=3, output_name="multimodal_qa.jsonl"):
+    @staticmethod
+    def _task_value(config, task_name, default=None):
+        if config is None:
+            return default
+        value = config.get(task_name, default)
+        return default if value is None else value
+
+    @staticmethod
+    def _remaining_task_capacity(task_counts, task_name, max_rows_per_task):
+        cap = DataGenerator._task_value(max_rows_per_task, task_name)
+        if cap is None:
+            return None
+        return max(0, cap - task_counts[task_name])
+
+    @staticmethod
+    def _append_allowed(task_counts, task_name, max_rows_per_task):
+        remaining = DataGenerator._remaining_task_capacity(
+            task_counts,
+            task_name,
+            max_rows_per_task,
+        )
+        return remaining is None or remaining > 0
+
+    def generate(
+        self,
+        questions_per_reference=3,
+        output_name="multimodal_qa.jsonl",
+        questions_per_task=None,
+        max_rows_per_task=None,
+    ):
         package = self.packing()
         dataset = []
+        task_counts = Counter()
 
         for first, second in tqdm(package, desc="Generating QA pairs"):
             first_content = first["content"] # might be any  type
             second_content= second["content"] # might be any type
             task_name = self.get_task_name(first, second)
+            if task_name is None:
+                continue
+
+            remaining_capacity = self._remaining_task_capacity(
+                task_counts,
+                task_name,
+                max_rows_per_task,
+            )
+            if remaining_capacity == 0:
+                continue
+
+            task_questions_per_reference = self._task_value(
+                questions_per_task,
+                task_name,
+                questions_per_reference,
+            )
+            if remaining_capacity is not None:
+                task_questions_per_reference = min(
+                    task_questions_per_reference,
+                    remaining_capacity,
+                )
+            if task_questions_per_reference <= 0:
+                continue
+
             match task_name:
                 case "visual_qa":
                     prompt = f"""
@@ -208,7 +263,7 @@ class DataGenerator:
                             Task: {task_name}
                             
                             Use ONLY the image and text context.
-                            Generate {questions_per_reference} question-answer pairs.
+                            Generate {task_questions_per_reference} question-answer pairs.
                             
                             Rules:
                             - Each question must require visual understanding of the image.
@@ -233,6 +288,8 @@ class DataGenerator:
                     qa_pairs = self.call_vlm(prompt, image_paths=[first_content]) # image only
 
                     for qa in qa_pairs:
+                        if not self._append_allowed(task_counts, task_name, max_rows_per_task):
+                            break
                         dataset.append({
                             "question": qa["question"],
                             "answer": qa["answer"],
@@ -240,14 +297,15 @@ class DataGenerator:
                             "reference_text": second_content,
                             "reference_image_path": first_content,
                         })
+                        task_counts[task_name] += 1
                 case "image_seg":
                     prompt = f"""
                             You are generating an image segmentation dataset.
                             
                             Task: {task_name}
                             
-                            Use the input image to write {questions_per_reference} segmentation instructions.
-                            The expected segmentation output is stored separately by the dataset builder as base64.
+                            Use the input image to write {task_questions_per_reference} segmentation instructions.
+                            The expected segmentation output is stored separately by target_image_path.
                             
                             Rules:
                             - Ask for a segmentation mask or fault mask from the input image.
@@ -260,30 +318,31 @@ class DataGenerator:
                             [
                               {{
                                 "instruction": "...",
-                                "output_type": "image_base64"
+                                "output_type": "image_path"
                               }}
                             ]
                             """
                     qa_pairs = self.call_vlm(prompt, image_paths=[first_content,second_content])
-                    result_image_base64 = self.encode_file_base64(second_content)
 
                     for qa in qa_pairs:
+                        if not self._append_allowed(task_counts, task_name, max_rows_per_task):
+                            break
                         dataset.append({
                             "instruction": qa["instruction"],
-                            "output_type": qa.get("output_type", "image_base64"),
-                            "result_image_base64": result_image_base64,
+                            "output_type": "image_path",
                             "task": task_name,
                             "reference_image_path": first_content,
                             "target_image_path": second_content,
                         })
+                        task_counts[task_name] += 1
                 case "image_gen_from_text":
                     prompt = f"""
                             You are generating a text-to-image dataset.
                             
                             Task: {task_name}
                             
-                            Use the target image to write {questions_per_reference} text prompts that could generate it.
-                            The expected image output is stored separately by the dataset builder as base64.
+                            Use the target image to write {task_questions_per_reference} text prompts that could generate it.
+                            The expected image output is stored separately by target_image_path.
                             
                             Rules:
                             - Prompts must describe the target image clearly.
@@ -296,30 +355,31 @@ class DataGenerator:
                             [
                               {{
                                 "prompt": "...",
-                                "output_type": "image_base64"
+                                "output_type": "image_path"
                               }}
                             ]
                             """
                     qa_pairs = self.call_vlm(prompt, image_paths=[second_content])
-                    result_image_base64 = self.encode_file_base64(second_content)
 
                     for qa in qa_pairs:
+                        if not self._append_allowed(task_counts, task_name, max_rows_per_task):
+                            break
                         dataset.append({
                             "prompt": qa["prompt"],
-                            "output_type": qa.get("output_type", "image_base64"),
-                            "result_image_base64": result_image_base64,
+                            "output_type": "image_path",
                             "task": task_name,
                             "reference_text": first_content,
                             "target_image_path": second_content,
                         })
+                        task_counts[task_name] += 1
                 case "image_gen_from_image":
                     prompt = f"""
                             You are generating an image-to-image dataset.
                             
                             Task: {task_name}
                             
-                            Use the input image and target image relationship to write {questions_per_reference} image editing or image transformation instructions.
-                            The expected output image is stored separately by the dataset builder as base64.
+                            Use the input image and target image relationship to write {task_questions_per_reference} image editing or image transformation instructions.
+                            The expected output image is stored separately by target_image_path.
                             
                             Rules:
                             - Instructions must describe how to transform the input image into the target image.
@@ -332,22 +392,23 @@ class DataGenerator:
                             [
                               {{
                                 "instruction": "...",
-                                "output_type": "image_base64"
+                                "output_type": "image_path"
                               }}
                             ]
                             """
                     qa_pairs = self.call_vlm(prompt, image_paths=[first_content,second_content]) # both images input
-                    result_image_base64 = self.encode_file_base64(second_content)
 
                     for qa in qa_pairs:
+                        if not self._append_allowed(task_counts, task_name, max_rows_per_task):
+                            break
                         dataset.append({
                             "instruction": qa["instruction"],
-                            "output_type": qa.get("output_type", "image_base64"),
-                            "result_image_base64": result_image_base64,
+                            "output_type": "image_path",
                             "task": task_name,
                             "reference_image_path": first_content,
                             "target_image_path": second_content,
                         })
+                        task_counts[task_name] += 1
                 case "text_qa":
                     prompt = f"""
                             You are generating a text QA dataset.
@@ -355,7 +416,7 @@ class DataGenerator:
                             Task: {task_name}
                             
                             Use ONLY the text context below.
-                            Generate {questions_per_reference} question-answer pairs.
+                            Generate {task_questions_per_reference} question-answer pairs.
                             
                             Rules:
                             - Answers must be text.
@@ -379,6 +440,8 @@ class DataGenerator:
                     qa_pairs = self.call_llm(prompt)
 
                     for qa in qa_pairs:
+                        if not self._append_allowed(task_counts, task_name, max_rows_per_task):
+                            break
                         dataset.append({
                             "question": qa["question"],
                             "answer": qa["answer"],
@@ -386,6 +449,7 @@ class DataGenerator:
                             "reference_text": first_content,
                             "reference_text_2": second_content,
                         })
+                        task_counts[task_name] += 1
                 case _:
                     continue # skip unsupported task pairs
 
@@ -394,12 +458,8 @@ class DataGenerator:
             for row in dataset:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+        print(f"Generated rows by task: {dict(task_counts)}")
         return output_path
-
-    @staticmethod
-    def encode_file_base64(path):
-        with open(path, "rb") as file:
-            return base64.b64encode(file.read()).decode("utf-8")
 
     def call_llm(self, prompt):
         response = self.client.messages.create(
@@ -487,5 +547,17 @@ class DataGenerator:
 # print(path)
 
 if __name__ == "__main__":
-    gen = DataGenerator(image_top_k=100,text_top_k=100)
-    print(gen.packing())
+    gen = DataGenerator(image_top_k=100,text_top_k=100,)
+    print(gen.generate( questions_per_task={
+          "visual_qa": 2,
+          "image_seg": 1,
+          "text_qa": 3,
+          "image_gen_from_image": 1,
+      },
+      max_rows_per_task={
+          "visual_qa": 500,
+          "image_seg": 500,
+          "text_qa": 500,
+          "image_gen_from_image": 0,
+          "image_gen_from_text": 0,
+      },))

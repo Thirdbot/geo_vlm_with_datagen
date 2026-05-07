@@ -276,7 +276,38 @@ def load_model_and_optimizer(args, device):
     if checkpoint and checkpoint.get("scheduler_state"):
         scheduler.load_state_dict(checkpoint["scheduler_state"])
 
-    return model, optimizer, scheduler, start_epoch, global_step
+    return model, optimizer, scheduler, checkpoint, start_epoch, global_step
+
+
+def best_loss_from_checkpoint(checkpoint):
+    if not checkpoint:
+        return None
+    extra = checkpoint.get("extra") or {}
+    best_loss = extra.get("best_val_loss")
+    if best_loss is None:
+        return None
+    return float(best_loss)
+
+
+def best_loss_from_history(output_dir):
+    history_path = Path(output_dir) / "history.csv"
+    if not history_path.exists():
+        return None
+
+    losses_by_epoch = defaultdict(list)
+    with history_path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            if row.get("split") != "val" or not row.get("loss"):
+                continue
+            losses_by_epoch[int(row["epoch"])].append(float(row["loss"]))
+
+    if not losses_by_epoch:
+        return None
+    return min(
+        sum(losses) / len(losses)
+        for losses in losses_by_epoch.values()
+    )
 
 
 def output_metrics(outputs, task):
@@ -370,7 +401,7 @@ def train(args):
     if device.type == "cuda":
         print(f"gpu: {torch.cuda.get_device_name(0)}")
 
-    model, optimizer, scheduler, start_epoch, global_step = load_model_and_optimizer(args, device)
+    model, optimizer, scheduler, checkpoint, start_epoch, global_step = load_model_and_optimizer(args, device)
     print_parameter_report(model)
     image_processor = AutoImageProcessor.from_pretrained(model.vision_name)
 
@@ -420,6 +451,20 @@ def train(args):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     history = MetricHistory(output_dir, resume=bool(args.resume))
+    best_val_loss = (
+        best_loss_from_checkpoint(checkpoint)
+        if checkpoint is not None
+        else None
+    )
+    history_best_val_loss = best_loss_from_history(output_dir) if args.resume else None
+    if history_best_val_loss is not None:
+        best_val_loss = (
+            history_best_val_loss
+            if best_val_loss is None
+            else min(best_val_loss, history_best_val_loss)
+        )
+    if best_val_loss is not None:
+        print(f"best val loss before training: {best_val_loss:.4f}")
 
     for epoch in range(start_epoch, args.epochs):
         progress = tqdm(dataloader, desc=f"epoch {epoch + 1}/{args.epochs}")
@@ -472,6 +517,24 @@ def train(args):
             if val_loss is not None:
                 scheduler.step(val_loss)
                 print(f"epoch {epoch + 1} val_loss={val_loss:.4f} lr={optimizer.param_groups[0]['lr']:.6g}")
+                if best_val_loss is None or val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_path = output_dir / "checkpoint-best.pt"
+                    model.save_checkpoint(
+                        best_path,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch + 1,
+                        step=global_step,
+                        extra={
+                            "best_val_loss": best_val_loss,
+                            "best_epoch": epoch + 1,
+                            "train_rows": len(train_rows),
+                            "val_rows": len(val_rows),
+                            "test_rows": len(test_rows),
+                        },
+                    )
+                    print(f"saved best checkpoint: {best_path} val_loss={best_val_loss:.4f}")
 
         checkpoint_path = output_dir / f"checkpoint-epoch-{epoch + 1}.pt"
         model.save_checkpoint(
@@ -481,6 +544,7 @@ def train(args):
             epoch=epoch + 1,
             step=global_step,
             extra={
+                "best_val_loss": best_val_loss,
                 "train_rows": len(train_rows),
                 "val_rows": len(val_rows),
                 "test_rows": len(test_rows),
@@ -494,6 +558,7 @@ def train(args):
         scheduler=scheduler,
         epoch=args.epochs,
         step=global_step,
+        extra={"best_val_loss": best_val_loss},
     )
     if test_rows:
         evaluate(
