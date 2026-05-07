@@ -20,8 +20,22 @@ def load_model(checkpoint_path, device):
     return model
 
 
+def build_text_prompt(args):
+    if args.task == "visual_qa":
+        return f"Task: visual_qa\nQuestion: {args.prompt}\nAnswer:"
+    if args.task == "text_qa":
+        return (
+            "Task: text_qa\n"
+            f"Context: {args.context}\n"
+            f"Additional context: {args.context_2}\n"
+            f"Question: {args.prompt}\n"
+            "Answer:"
+        )
+    raise ValueError(f"Unsupported text task: {args.task}")
+
+
 def infer_text(model, image_processor, args, device):
-    prompt = model.format_prompt(args.prompt, task=args.task)
+    prompt = build_text_prompt(args)
     tokens = model.tokenizer(prompt, return_tensors="pt").to(device)
 
     pixel_values = None
@@ -69,6 +83,8 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--task", required=True, choices=["visual_qa", "text_qa", "image_seg"])
     parser.add_argument("--prompt", default="")
+    parser.add_argument("--context", default="")
+    parser.add_argument("--context-2", default="")
     parser.add_argument("--image", default=None)
     parser.add_argument("--output", default="generated_data/predicted_mask.png")
     parser.add_argument("--device", default=None)

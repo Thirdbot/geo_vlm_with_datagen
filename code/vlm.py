@@ -15,6 +15,42 @@ SEGMENTATION_TASKS = {"image_seg"}
 SUPPORTED_TASKS = TEXT_TASKS | SEGMENTATION_TASKS
 
 
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class LightUNetDecoder(nn.Module):
+    def __init__(self, in_channels, base_channels=128):
+        super().__init__()
+        self.input_block = ConvBlock(in_channels, base_channels)
+        self.up1 = nn.ConvTranspose2d(base_channels, base_channels // 2, kernel_size=2, stride=2)
+        self.block1 = ConvBlock(base_channels // 2, base_channels // 2)
+        self.up2 = nn.ConvTranspose2d(base_channels // 2, base_channels // 4, kernel_size=2, stride=2)
+        self.block2 = ConvBlock(base_channels // 4, base_channels // 4)
+        self.up3 = nn.ConvTranspose2d(base_channels // 4, base_channels // 8, kernel_size=2, stride=2)
+        self.block3 = ConvBlock(base_channels // 8, base_channels // 8)
+        self.out_conv = nn.Conv2d(base_channels // 8, 1, kernel_size=1)
+
+    def forward(self, x):
+        x = self.input_block(x)
+        x = self.block1(self.up1(x))
+        x = self.block2(self.up2(x))
+        x = self.block3(self.up3(x))
+        return self.out_conv(x)
+
+
 class multitaskVLM(nn.Module):
     def __init__(
         self,
@@ -83,16 +119,7 @@ class multitaskVLM(nn.Module):
         nn.init.normal_(self.query_tokens, std=0.02)
 
         self.visual_projection = nn.Linear(qformer_hidden_size, llm_hidden)
-        self.segmentation_decoder = nn.Sequential(
-            nn.Linear(qformer_hidden_size, 14 * 14 * 64),
-            nn.GELU(),
-            nn.Unflatten(1, (64, 14, 14)),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv2d(16, 1, kernel_size=3, padding=1),
-        )
+        self.segmentation_decoder = LightUNetDecoder(vision_hidden)
 
         if freeze_vision:
             for parameter in self.vision_encoder.parameters():
@@ -169,6 +196,26 @@ class multitaskVLM(nn.Module):
             visual_embeds = visual_embeds.to(dtype=dtype)
         return visual_embeds
 
+    def _vision_feature_map(self, pixel_values):
+        if pixel_values is None:
+            raise ValueError("pixel_values is required for image_seg")
+
+        vision_outputs = self.vision_encoder(pixel_values=pixel_values)
+        tokens = vision_outputs.last_hidden_state
+        patch_tokens = tokens[:, 1:, :]
+
+        num_patches = patch_tokens.shape[1]
+        grid_size = int(num_patches ** 0.5)
+        if grid_size * grid_size != num_patches:
+            raise ValueError(f"Cannot reshape {num_patches} vision patches to a square grid")
+
+        return patch_tokens.transpose(1, 2).reshape(
+            patch_tokens.shape[0],
+            patch_tokens.shape[2],
+            grid_size,
+            grid_size,
+        )
+
     def forward_text(
         self,
         input_ids,
@@ -207,9 +254,8 @@ class multitaskVLM(nn.Module):
         )
 
     def forward_segmentation(self, pixel_values, masks=None, output_size=None):
-        query_output = self._qformer_output(pixel_values)
-        pooled_query = query_output.mean(dim=1)
-        logits = self.segmentation_decoder(pooled_query)
+        feature_map = self._vision_feature_map(pixel_values)
+        logits = self.segmentation_decoder(feature_map)
 
         if output_size is not None:
             logits = F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)

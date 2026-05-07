@@ -576,7 +576,7 @@ def train(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train multitask VLM with checkpoint resume.")
-    parser.add_argument("--dataset", default="generated_data/multimodal_qa.jsonl")
+    parser.add_argument("--dataset", default="generated_data/multimodal_qa_200.jsonl")
     parser.add_argument("--output-dir", default="checkpoints")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--vision-name", default="facebook/dinov2-base")
