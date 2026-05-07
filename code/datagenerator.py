@@ -216,16 +216,34 @@ class DataGenerator:
         )
         return remaining is None or remaining > 0
 
+    @staticmethod
+    def _normalize_pattern(text):
+        return " ".join(
+            re.sub(r"[^a-z0-9 ]+", " ", text.lower()).split()
+        )
+
+    @staticmethod
+    def _reuse_allowed(counter, key, max_reuse):
+        if max_reuse is None:
+            return True
+        return counter[key] < max_reuse
+
     def generate(
         self,
         questions_per_reference=3,
-        output_name="multimodal_qa.jsonl",
+        output_name="multimodal_qa_200.jsonl",
         questions_per_task=None,
         max_rows_per_task=None,
+        max_reference_text_reuse=3,
+        max_question_pattern_reuse=2,
+        max_instruction_pattern_reuse=3,
     ):
         package = self.packing()
         dataset = []
         task_counts = Counter()
+        reference_text_counts = Counter()
+        question_pattern_counts = Counter()
+        instruction_pattern_counts = Counter()
 
         for first, second in tqdm(package, desc="Generating QA pairs"):
             first_content = first["content"] # might be any  type
@@ -290,6 +308,19 @@ class DataGenerator:
                     for qa in qa_pairs:
                         if not self._append_allowed(task_counts, task_name, max_rows_per_task):
                             break
+                        question_pattern = self._normalize_pattern(qa["question"])
+                        if not self._reuse_allowed(
+                            reference_text_counts,
+                            second_content,
+                            max_reference_text_reuse,
+                        ):
+                            continue
+                        if not self._reuse_allowed(
+                            question_pattern_counts,
+                            question_pattern,
+                            max_question_pattern_reuse,
+                        ):
+                            continue
                         dataset.append({
                             "question": qa["question"],
                             "answer": qa["answer"],
@@ -298,6 +329,8 @@ class DataGenerator:
                             "reference_image_path": first_content,
                         })
                         task_counts[task_name] += 1
+                        reference_text_counts[second_content] += 1
+                        question_pattern_counts[question_pattern] += 1
                 case "image_seg":
                     prompt = f"""
                             You are generating an image segmentation dataset.
@@ -327,6 +360,13 @@ class DataGenerator:
                     for qa in qa_pairs:
                         if not self._append_allowed(task_counts, task_name, max_rows_per_task):
                             break
+                        instruction_pattern = self._normalize_pattern(qa["instruction"])
+                        if not self._reuse_allowed(
+                            instruction_pattern_counts,
+                            instruction_pattern,
+                            max_instruction_pattern_reuse,
+                        ):
+                            continue
                         dataset.append({
                             "instruction": qa["instruction"],
                             "output_type": "image_path",
@@ -335,6 +375,7 @@ class DataGenerator:
                             "target_image_path": second_content,
                         })
                         task_counts[task_name] += 1
+                        instruction_pattern_counts[instruction_pattern] += 1
                 case "image_gen_from_text":
                     prompt = f"""
                             You are generating a text-to-image dataset.
@@ -401,6 +442,13 @@ class DataGenerator:
                     for qa in qa_pairs:
                         if not self._append_allowed(task_counts, task_name, max_rows_per_task):
                             break
+                        instruction_pattern = self._normalize_pattern(qa["instruction"])
+                        if not self._reuse_allowed(
+                            instruction_pattern_counts,
+                            instruction_pattern,
+                            max_instruction_pattern_reuse,
+                        ):
+                            continue
                         dataset.append({
                             "instruction": qa["instruction"],
                             "output_type": "image_path",
@@ -409,6 +457,7 @@ class DataGenerator:
                             "target_image_path": second_content,
                         })
                         task_counts[task_name] += 1
+                        instruction_pattern_counts[instruction_pattern] += 1
                 case "text_qa":
                     prompt = f"""
                             You are generating a text QA dataset.
@@ -442,6 +491,13 @@ class DataGenerator:
                     for qa in qa_pairs:
                         if not self._append_allowed(task_counts, task_name, max_rows_per_task):
                             break
+                        question_pattern = self._normalize_pattern(qa["question"])
+                        if not self._reuse_allowed(
+                            question_pattern_counts,
+                            question_pattern,
+                            max_question_pattern_reuse,
+                        ):
+                            continue
                         dataset.append({
                             "question": qa["question"],
                             "answer": qa["answer"],
@@ -450,6 +506,7 @@ class DataGenerator:
                             "reference_text_2": second_content,
                         })
                         task_counts[task_name] += 1
+                        question_pattern_counts[question_pattern] += 1
                 case _:
                     continue # skip unsupported task pairs
 
@@ -547,17 +604,21 @@ class DataGenerator:
 # print(path)
 
 if __name__ == "__main__":
-    gen = DataGenerator(image_top_k=100,text_top_k=100,)
+    gen = DataGenerator(image_top_k=500,text_top_k=800,)
     print(gen.generate( questions_per_task={
-          "visual_qa": 2,
+          "visual_qa": 1,
           "image_seg": 1,
-          "text_qa": 3,
-          "image_gen_from_image": 1,
+          "text_qa": 2,
+          # "image_gen_from_image": 1,
       },
       max_rows_per_task={
-          "visual_qa": 500,
-          "image_seg": 500,
-          "text_qa": 500,
+          "visual_qa": 400,
+          "image_seg": 400,
+          "text_qa": 400,
           "image_gen_from_image": 0,
           "image_gen_from_text": 0,
-      },))
+      },
+        max_reference_text_reuse=3,
+        max_question_pattern_reuse=2,
+        max_instruction_pattern_reuse=3,
+    ))
